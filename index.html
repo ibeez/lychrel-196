@@ -1,0 +1,236 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>196, Fig. 19</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  @font-face { font-family: "Gaegu"; font-weight: 400; src: url("fonts/gaegu-latin-400-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Gaegu"; font-weight: 700; src: url("fonts/gaegu-latin-700-normal.woff2") format("woff2"); }
+  :root { --paper:#fbf5e6; --label:#48545c; --hand:"Gaegu","Comic Sans MS","Chalkboard SE",cursive; color-scheme: light; }
+  html, body { background: var(--paper); color: var(--label); }
+  body { margin:0; font-family:var(--hand); display:flex; flex-direction:column; align-items:center;
+    padding:24px max(16px, env(safe-area-inset-right,0px)) 40px max(16px, env(safe-area-inset-left,0px)); gap:14px; }
+  canvas { width:min(100%,760px); aspect-ratio:1200/1000; max-width:100%; display:block; touch-action:none; outline:none; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .controls button { font:700 22px/1 var(--hand); color:var(--label); background:transparent; border:1.5px solid var(--label);
+    border-radius:10px; padding:10px 18px; cursor:pointer; }
+  .controls button:disabled { opacity:.35; cursor:default; }
+  .controls button:focus-visible, canvas:focus-visible { outline:2px solid #0846a9; outline-offset:3px; }
+  .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+</style>
+
+<canvas id="plate" width="1200" height="1000" tabindex="0" role="application"
+  aria-label="A six-dial combination lock above a three by three wall of small locks, numbered 192 to 200, with 196 in the middle. Tap a small lock to run it: reverse the digits, add, and repeat until the number reads the same both ways, and the lock opens. All eight neighbours open within 8 steps. 196 never does: its dials spin forever, and nobody knows if it ever lands."></canvas>
+<div class="controls">
+  <button id="all" type="button">try them all</button>
+  <button id="mid" type="button">try 196</button>
+  <button id="reset" type="button">reset</button>
+  <button id="snd" type="button">sound: on</button>
+</div>
+<p id="live" class="sr" aria-live="polite"></p>
+
+<script src="../../design/ascii/palette.js"></script>
+<script src="../../design/ascii/parts.js"></script>
+<script>
+const M = window.MARKERS, AP = window.AsciiParts;
+const INDIGO = M['POSCA Indigo'], BLUE = M['Dark Blue Light 15'], RED = M['POSCA Tomato Red'],
+      ORANGE = M['POSCA Orange'], GREY = M['Cool Grey C43'], INK = M['Blue Grey B47'];
+const W = 1200, H = 1000, ND = 6, DX = [...Array(ND)].map((_, i) => 600 + (i - 2.5) * 118), CY = 380, GAP = 92;
+const cv = document.getElementById('plate'), $ = id => document.getElementById(id);
+const mod = (n, m) => ((n % m) + m) % m, clamp = v => Math.max(0, Math.min(1, v));
+// ?render and ?measure (tools/export.py) run on a virtual clock so every frame is the same every time
+const Q = new URLSearchParams(location.search), RENDER = Q.has('render') || Q.has('measure');
+let VT = null, SPEED = 1;
+const nowS = () => VT === null ? performance.now() / 1000 : VT;
+const timers = [], SOUNDS = [];
+const sleep = ms => RENDER ? new Promise(r => timers.push({ at: VT + ms / 1000 / SPEED, r })) : new Promise(r => setTimeout(r, ms));
+
+// ---- the wall: 192 to 200, 196 in the middle
+const WALL = [192, 193, 194, 195, 196, 197, 198, 199, 200];
+const rev = n => BigInt(String(n).split('').reverse().join(''));
+const isPal = n => { const s = String(n); return s === s.split('').reverse().join(''); };
+const path = n => { let v = BigInt(n); const a = [v]; for (let k = 0; k < 60; k++) { v = v + rev(v); a.push(v); if (isPal(v)) return a; } return null; };
+const locks = WALL.map(n => ({ n, open: false, tOpen: 0, steps: null }));
+
+const pos = Array(ND).fill(0), target = Array(ND).fill(0), lastR = Array(ND).fill(0);
+let mode = 'set', active = null, status = 'tap a lock. reverse the digits, add, repeat.', lastLive = '', runId = 0;
+let shown = '', popT = 0;
+let forever = false, foreverK = 0, foreverV = 196n, foreverDigits = 3, trail = [];
+const pad = v => String(v).padStart(ND, ' ');
+(s => { for (let i = 0; i < ND; i++) pos[i] = target[i] = lastR[i] = s[i] === ' ' ? 0 : +s[i]; })(pad(196));
+
+// ---- sound
+let ac = null, soundOn = true, lastTick = 0;
+function audio() { if (RENDER) return; if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } if (ac && ac.state === 'suspended') ac.resume(); }
+function blip(f, dur, vol, type = 'triangle', at = 0) {
+  if (RENDER) { if (soundOn) SOUNDS.push({ t: VT + at, f, dur, vol, type }); return; }
+  if (!ac || !soundOn) return;
+  const t = ac.currentTime + at, o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = f; g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+function tick() { const n = nowS() * 1000; if (n - lastTick < 34) return; lastTick = n; blip(760 + Math.random() * 90, 0.05, forever ? 0.035 : 0.07); }
+const clack = () => { blip(196, 0.14, 0.16); blip(392, 0.06, 0.05); };
+const chime = () => [523.25, 659.25, 783.99].forEach((f, i) => blip(f, 0.45, 0.1, 'sine', i * 0.09));
+
+// ---- spinning
+let settle = null;
+function spinTo(v) {
+  const s = pad(String(v).slice(-ND));
+  for (let i = 0; i < ND; i++) { const d = s[i] === ' ' ? 0 : +s[i]; let df = mod(d - mod(Math.round(pos[i]), 10), 10); if (df > 5) df -= 10; target[i] = Math.round(pos[i]) + df; }
+  return new Promise(r => { settle = r; });
+}
+async function runLock(L, fast) {
+  const id = ++runId; forever = false; active = L; trail = []; audio();
+  const p = path(L.n);
+  if (!p) return runForever(id, L);
+  mode = 'run';
+  await spinTo(p[0]); if (id !== runId) return;
+  for (let k = 1; k < p.length; k++) {
+    status = `${p[k - 1]} + ${rev(p[k - 1])} = ${p[k]}`;
+    trail.push({ txt: status, t0: nowS() });
+    await sleep(fast ? 120 : 420); if (id !== runId) return;
+    await spinTo(p[k]); clack(); if (id !== runId) return;
+    await sleep(fast ? 120 : 420); if (id !== runId) return;
+  }
+  L.open = true; L.tOpen = nowS(); L.steps = p.length - 1; chime();
+  status = `${p[p.length - 1]} reads the same both ways. ${L.n} opens in ${L.steps} step${L.steps === 1 ? '' : 's'}.`;
+  mode = 'set';
+}
+async function runForever(id, L) {
+  mode = 'run'; forever = true; foreverK = 0; foreverV = BigInt(L.n); foreverDigits = String(L.n).length;
+  status = 'reverse and add...';
+  while (id === runId) {
+    foreverV = foreverV + rev(foreverV); foreverK++; foreverDigits = String(foreverV).length;
+    status = `step ${foreverK}. ${foreverDigits} digits. still no palindrome.`;
+    await sleep(foreverK < 40 ? 180 : 90);
+    if (foreverK > 5000) break;
+  }
+}
+async function tryAll() {
+  const id = ++runId;
+  for (const L of locks) { if (L === locks[4] || L.open || !path(L.n)) continue; await runLock(L, true); if (runId !== id + 0 && active !== L) return; }
+  runLock(locks[4], false);
+}
+function reset() { runId++; forever = false; active = null; trail = []; locks.forEach((L, i) => { L.n = WALL[i]; L.open = false; L.steps = null; }); mode = 'set'; status = 'tap a lock. reverse the digits, add, repeat.'; spinTo(196); settle = null; }
+
+// ---- input: tap a small lock
+const GX = [400, 600, 800], GY = [700, 805, 910], LW = 170, LH = 84;
+const pt = e => { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height }; };
+// tap a lock to run it. drag a side lock up or down to change its number (196 stays put)
+let grab = null;
+const lockAt = p => locks.find((L, i) => Math.abs(p.x - GX[i % 3]) < LW / 2 && Math.abs(p.y - GY[Math.floor(i / 3)]) < LH / 2);
+cv.addEventListener('pointerdown', e => {
+  const p = pt(e), L = lockAt(p); if (!L) return; audio();
+  grab = { L, y0: p.y, n0: L.n, moved: false }; cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e => {
+  if (!grab || grab.L === locks[4]) return;
+  const dy = grab.y0 - pt(e).y; if (Math.abs(dy) > 8) grab.moved = true;
+  if (!grab.moved) return;
+  const n = Math.max(1, Math.min(999, grab.n0 + Math.round(dy / 14)));
+  if (n !== grab.L.n) { if (active === grab.L) { runId++; forever = false; mode = 'set'; } grab.L.n = n; grab.L.open = false; grab.L.steps = null; tick(); }
+});
+cv.addEventListener('pointerup', () => { if (grab && !grab.moved) runLock(grab.L, false); grab = null; });
+cv.addEventListener('pointercancel', () => { grab = null; });
+cv.addEventListener('keydown', e => { const k = +e.key; if (k >= 1 && k <= 9) { runLock(locks[k - 1], false); e.preventDefault(); } });
+$('all').onclick = tryAll; $('mid').onclick = () => runLock(locks[4], false); $('reset').onclick = reset;
+$('snd').onclick = () => { soundOn = !soundOn; $('snd').textContent = 'sound: ' + (soundOn ? 'on' : 'off'); audio(); };
+
+// ---- drawing
+function draw(d) {
+  const T = nowS();
+  d.text(600, 62, 'Fig. 19 · where it lands', { c: GREY, w: 700, size: 34 });
+  d.text(600, 132, 'palindromes', { c: RED, w: 700, size: 72 });
+  if (!RENDER) d.text(600, 625, 'drag a side lock up or down to pick your own number', { c: GREY, w: 400, size: 26 });
+  d.text(600, 192, 'reverse the digits, add, repeat until it reads the same both ways', { c: GREY, w: 400, size: 32 });
+
+  AP.frame(d, 230, 230, 970, 530);
+  for (let i = 0; i < ND; i++) {
+    const p = pos[i], base = Math.floor(p), fr = p - base, x = DX[i];
+    for (let k = -2; k <= 3; k++) {
+      const y = CY + (k - fr) * GAP, dist = Math.abs(y - CY);
+      if (y < 255 || y > 508) continue;
+      const ch = String(mod(base + k, 10));
+      const blur = forever ? 0.55 : 1;
+      if (dist < 46) d.mark(x, y, ch, { c: forever ? INDIGO : INK === 0 ? INK : INDIGO, w: 700, size: 108 - dist * 0.4, a: blur });
+      else d.text(x, y, ch, { c: GREY, w: 400, size: 84 - dist * 0.25, a: Math.max(0.2, 1 - dist / 170) * blur });
+    }
+  }
+  // each new line pops in with a little overshoot (the forever counter just ticks, no pop)
+  if (status !== shown) { shown = status; if (!forever || !popT) popT = T; }
+  const x = clamp((T - popT) / 0.32), c1 = 1.70158, back = 1 + (c1 + 1) * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+  d.text(600, 575, status, { c: forever ? RED : INK, w: 700, size: 38 * (0.3 + 0.7 * back), a: Math.min(1, (T - popT) / 0.12) });
+
+  // the wall of little locks
+  locks.forEach((L, i) => {
+    const x = GX[i % 3], y = GY[Math.floor(i / 3)], mid = L.n === 196;
+    const on = active === L && mode === 'run';
+    const pop = L.open ? 1 + 0.25 * Math.sin(Math.PI * clamp((T - L.tOpen) / 0.35)) : 1;
+    AP.frame(d, x - LW / 2, y - LH / 2, x + LW / 2, y + LH / 2, mid ? 3.5 : 2);
+    const c = L.open ? RED : mid ? (forever ? RED : INDIGO) : on ? ORANGE : INDIGO;
+    d.mark(x, y - (L.open ? 10 : 0), String(L.n), { c, w: 700, size: 52 * pop });
+    if (L.open) d.text(x, y + 26, `open · ${L.steps}`, { c: RED, w: 700, size: 24 });
+    else if (mid && forever) d.text(x, y + 28, 'still spinning', { c: RED, w: 700, size: 22, a: 0.6 + 0.4 * Math.sin(T * 4) });
+  });
+}
+
+// ---- loop
+function sim(dt) {
+  for (let i = 0; i < ND; i++) {
+    if (forever) target[i] = pos[i] + dt * (3 + i * 2.3);   // the dials never stop
+    const df = target[i] - pos[i];
+    pos[i] = forever ? target[i] : Math.abs(df) < 0.01 ? target[i] : pos[i] + df * (1 - Math.exp(-dt * 9 * SPEED));
+    if (Math.round(pos[i]) !== lastR[i]) { lastR[i] = Math.round(pos[i]); tick(); }
+  }
+  if (settle && pos.every((p, i) => Math.abs(target[i] - p) < 0.02)) { for (let i = 0; i < ND; i++) pos[i] = target[i]; const r = settle; settle = null; r(); }
+}
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - prev) / 1000); prev = now; sim(dt);
+  if (status !== lastLive) { lastLive = status; $('live').textContent = status; }
+  AP.plate(cv, draw, { w: W, h: H, time: now / 1000 });
+  requestAnimationFrame(frame);
+}
+// ---- video: the eight neighbours open in a quick ripple, then 196 spins and never opens, then the wall resets
+const T0 = 0.5, HOLD196 = 4.5;
+const EXPORT = { format: 'mp4', width: 1200, height: 1000, fps: 30, seconds: 17.6, loop: true, sound: true, background: 'paper' };
+const K = 3, WARP = () => K * 2 * Math.PI / 1.1 / EXPORT.seconds;
+async function stepTo(t) {
+  while (VT < t - 1e-9) {
+    const dt = Math.min(1 / 120, t - VT); VT += dt; sim(dt);
+    for (let k = timers.length - 1; k >= 0; k--) if (timers[k].at <= VT + 1e-9) timers.splice(k, 1)[0].r();
+    for (let j = 0; j < 20; j++) await Promise.resolve();
+  }
+}
+let scriptDone = false;
+async function script() {
+  SPEED = 3;
+  for (const L of locks) if (L !== locks[4]) await runLock(L, true);
+  SPEED = 1; runLock(locks[4], false);
+  await sleep(HOLD196 * 1000);
+  reset(); await sleep(300); await spinTo(196); scriptDone = true;
+}
+const loadJs = src => new Promise(r => { const e = document.createElement('script'); e.src = src; e.onload = r; document.head.append(e); });
+async function renderAudio() {
+  const buf = await SoundKit.render(EXPORT.seconds, 2, g => SOUNDS.forEach(e => {
+    const o = g.ac.createOscillator(), gn = g.ac.createGain();
+    o.type = e.type; o.frequency.value = e.f;
+    gn.gain.setValueAtTime(e.vol * 2, e.t); gn.gain.exponentialRampToValueAtTime(0.0001, e.t + e.dur);
+    o.connect(gn).connect(g.sfx); o.start(e.t); o.stop(e.t + e.dur + 0.02);
+  }));
+  return SoundKit.wav(buf);
+}
+async function startRender() {
+  VT = 0;
+  if (Q.has('measure')) { await stepTo(T0); script(); while (!scriptDone) await stepTo(VT + 1 / 30); console.log('MEASURE end=' + VT); return; }
+  await Promise.all([loadJs('../../design/tools/export-page.js'), loadJs('../../design/sound/sound.js')]);
+  let started = false;
+  await ExportPage.run(cv, async p => {
+    const t = p * EXPORT.seconds;
+    if (!started && t >= T0) { await stepTo(T0); started = true; script(); }
+    await stepTo(t); AP.plate(cv, draw, { w: W, h: H, time: VT * WARP() });
+  }, EXPORT, { audio: renderAudio });
+}
+Promise.all([document.fonts.load('700 20px Gaegu'), document.fonts.load('400 20px Gaegu')]).catch(() => {}).then(() => RENDER ? startRender() : requestAnimationFrame(frame));
+window.lock = { runLock, tryAll, reset, locks };
+</script>
